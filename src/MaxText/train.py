@@ -70,6 +70,8 @@ from MaxText.train_utils import validate_train_config
 from MaxText.metric_logger import record_activation_metrics
 # pylint: disable=too-many-positional-arguments
 
+import optax
+from optax._src.transform import ScaleByAdamState
 
 def get_first_step(state):
   return int(state.step)
@@ -289,7 +291,107 @@ def train_step(model, config, state_mesh_shardings, state, data, dropout_rng):
             jax.tree_util.tree_map_with_path(move, state_mesh_shardings.params),
         )
     )
-  new_state = state.apply_gradients(grads=grads)
+  if config.adamw_fused_memory_host_offload:
+    # Get learning rate for current step
+    learning_rate_schedule = maxtext_utils.create_learning_rate_schedule(config)
+    current_lr = learning_rate_schedule(state.step)
+
+    # Extract AdamW hyperparameters from config
+    b1 = config.adam_b1
+    b2 = config.adam_b2
+    eps = config.adam_eps
+    eps_root = config.adam_eps_root
+    weight_decay = config.adam_weight_decay
+    mu_dtype=config.mu_dtype
+
+    # Extract Adam state from optimizer state structure
+    # The optimizer state may be a single ScaleByAdamState or a tuple containing it
+    adam_state = None
+    if hasattr(state.opt_state, 'count') and hasattr(state.opt_state, 'mu') and hasattr(state.opt_state, 'nu'):
+      # Single Adam state
+      adam_state = state.opt_state
+      adam_state_is_single = True
+    else:
+      # Composed state - find the Adam component
+      for state_component in state.opt_state:
+        if hasattr(state_component, 'count') and hasattr(state_component, 'mu') and hasattr(state_component, 'nu'):
+          adam_state = state_component
+          adam_state_is_single = False
+          break
+
+    if adam_state is None:
+      raise ValueError("Could not find Adam state in optimizer state. Make sure you're using adamw optimizer.")
+
+    # Get current optimizer state values
+    current_step = adam_state.count + 1
+    current_mu = adam_state.mu
+    current_nu = adam_state.nu
+
+    # Import and create the fused function from optax
+    # This is still created INSIDE train_step to maintain JIT visibility
+    from optax._src.transform import create_adamw_update_fused
+
+    adamw_update_all = create_adamw_update_fused(
+        b1=b1,
+        b2=b2,
+        eps=eps,
+        eps_root=eps_root,
+        weight_decay=weight_decay,
+    )
+
+    # Define leaf checker: treat AdamW output 3-tuples as single leaves
+    def is_adamw_output_leaf(node):
+      """Tell JAX to treat our 3-tuples as single leaves, not PyTree containers"""
+      return isinstance(node, tuple) and len(node) == 3
+
+    # Apply single fused function using is_leaf to preserve tuple structure
+    all_results = jax.tree_util.tree_map(
+        lambda param, grad, mu, nu: adamw_update_all(param, grad, mu, nu, current_step, current_lr),
+        state.params, grads, current_mu, current_nu,
+        is_leaf=is_adamw_output_leaf
+    )
+
+    # Extract outputs using is_leaf - tuples are treated as single values!
+    new_params = jax.tree_util.tree_map(
+        lambda tuple_leaf: tuple_leaf[0],  # Extract new_param (device memory)
+        all_results,
+        is_leaf=is_adamw_output_leaf
+    )
+
+    new_mu = jax.tree_util.tree_map(
+        lambda tuple_leaf: tuple_leaf[1],  # Extract new_mu (host memory)
+        all_results,
+        is_leaf=is_adamw_output_leaf
+    )
+
+    new_nu = jax.tree_util.tree_map(
+        lambda tuple_leaf: tuple_leaf[2],  # Extract new_nu (host memory)
+        all_results,
+        is_leaf=is_adamw_output_leaf
+    )
+
+    # Reconstruct optimizer state
+    new_adam_state = optax.ScaleByAdamState(count=current_step, mu=new_mu, nu=new_nu)
+
+    # Handle composed optimizer state structure
+    if adam_state_is_single:
+      # Single Adam state
+      new_opt_state = new_adam_state
+    else:
+      # Composed state - rebuild with new Adam state in the correct position
+      new_opt_state = tuple(
+          new_adam_state if (hasattr(state_comp, 'count') and hasattr(state_comp, 'mu') and hasattr(state_comp, 'nu'))
+          else state_comp
+          for state_comp in state.opt_state
+      )
+
+    # Create new state with directly replaced parameters
+    new_state = state.replace(
+      params=new_params,
+      opt_state=new_opt_state
+    )
+  else:
+    new_state = state.apply_gradients(grads=grads)
 
   scalar_metrics = {
       "learning/loss": loss,
